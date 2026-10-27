@@ -1,0 +1,286 @@
+--- a/lib/util/game_cores.dart
++++ b/lib/util/game_cores.dart
+@@ -23,6 +23,55 @@
+ /// desktop.
+ const String installedCoresPreferenceKey = 'installed_libretro_cores';
+ 
++/// Nix owns these binaries and optional system assets. An unset environment
++/// variable keeps the normal download-based installation behavior.
++final Map<String, _ManagedCore>? _managedCores = _readManagedCores();
++
++Map<String, _ManagedCore>? _readManagedCores() {
++  final manifest = Platform.environment['MOONFIN_LIBRETRO_MANIFEST'];
++  if (manifest == null) return null;
++  final document = jsonDecode(File(manifest).readAsStringSync());
++  if (document is! Map<String, dynamic> ||
++      document['cores'] is! Map<String, dynamic>) {
++    throw const FormatException('Invalid Moonfin libretro core manifest');
++  }
++  final entries = document['cores'] as Map<String, dynamic>;
++  return Map<String, _ManagedCore>.unmodifiable({
++    for (final entry in entries.entries)
++      entry.key: _ManagedCore.fromJson(entry.value),
++  });
++}
++
++class _ManagedCore {
++  _ManagedCore.fromJson(Object? value)
++      : path = (value as Map<String, dynamic>)['path'] as String,
++        systemDirectory =
++            (value as Map<String, dynamic>)['systemDirectory'] as String?;
++
++  final String path;
++  final String? systemDirectory;
++}
++
++bool get usesNixCoreManifest => _managedCores != null;
++
++bool managedCoreExists(String coreId) {
++  final path = _managedCores?[coreId]?.path;
++  return path != null && File(path).existsSync();
++}
++
++/// Only existing managed binaries count as installed; downloaded remnants
++/// must never become a fallback when a Nix manifest is present.
++Set<String> get managedCoreIds => {
++  for (final id in _managedCores?.keys ?? const <String>[])
++    if (managedCoreExists(id)) id,
++};
++
++/// A core-specific asset root; all other cores use writable user BIOS storage.
++Future<Directory> systemDirectoryForCore(String coreId) async {
++  final root = _managedCores?[coreId]?.systemDirectory;
++  return root == null ? GameStorage.systemDir() : Directory(root);
++}
++
+ /// Runtime files a core needs in the system directory before it can boot.
+ class CoreSupportFiles {
+   const CoreSupportFiles({
+@@ -322,7 +371,7 @@
+ bool get supportsCoreDownloads =>
+     !bundlesGameCores &&
+     (PlatformDetection.isAndroid || PlatformDetection.isDesktop) &&
+-    currentBuildbotTarget() != null;
++    (usesNixCoreManifest || currentBuildbotTarget() != null);
+ 
+ /// Whether the player screen accepts keyboard gameplay, mapping keys to a
+ /// RetroPad mask sent down to the core. All desktops do, so a game is playable
+@@ -521,6 +570,11 @@
+     return id != null && macosBundledCores.contains(id);
+   }
+ 
++  if (usesNixCoreManifest) {
++    final id = libretroCoreId(core);
++    return id != null && managedCoreExists(id);
++  }
++
+   // Android and non-Apple desktop builds install cores on demand. The
+   // downloader records a core only after its binary has been written.
+   if (PlatformDetection.isAndroid || PlatformDetection.isDesktop) {
+@@ -558,6 +612,7 @@
+ /// has no build for the architecture. The zip holds one core file, which the
+ /// downloader extracts to [coreFileName] regardless of its name inside.
+ String? coreDownloadUrl(String coreId) {
++  if (usesNixCoreManifest) return null;
+   final target = currentBuildbotTarget();
+   if (target == null) return null;
+   return 'https://buildbot.libretro.com/nightly/${target.dir}/${_buildbotCoreName(coreId)}${target.suffix}';
+@@ -585,6 +640,10 @@
+ /// downloaded yet. tvOS bundles its cores in the app, so this only resolves
+ /// downloads on Android and desktop.
+ Future<String?> installedCorePath(String coreId) async {
++  if (usesNixCoreManifest) {
++    final path = _managedCores?[coreId]?.path;
++    return path != null && await File(path).exists() ? path : null;
++  }
+   final dir = await coresDirectory();
+   final file = File('${dir.path}/${coreFileName(coreId)}');
+   return await file.exists() ? file.path : null;
+@@ -602,6 +661,11 @@
+ Future<bool> coreSupportFilesInstalled(String coreId) async {
+   final files = coreSupportFilesFor(coreId);
+   if (files == null) return true;
++  if (usesNixCoreManifest) {
++    final root = _managedCores?[coreId]?.systemDirectory;
++    return root != null &&
++        await File('$root/${files.folder}/${files.markerFile}').exists();
++  }
+   final dir = await coreSupportDirectory(files);
+   return File('${dir.path}/${files.markerFile}').exists();
+ }
+--- a/lib/data/services/core_download_service.dart
++++ b/lib/data/services/core_download_service.dart
+@@ -17,9 +17,10 @@
+   final PreferenceStore _store;
+   final Dio _dio;
+ 
+-  /// The core ids recorded as installed.
+-  List<String> get installed =>
+-      _store.getStringList(installedCoresPreferenceKey) ?? const <String>[];
++  /// Installed cores come from the manifest on Nix, never from preferences.
++  List<String> get installed => usesNixCoreManifest
++      ? List.unmodifiable(managedCoreIds)
++      : _store.getStringList(installedCoresPreferenceKey) ?? const <String>[];
+ 
+   bool isInstalled(String coreId) => installed.contains(coreId);
+ 
+@@ -35,6 +36,9 @@
+     void Function(double progress)? onProgress,
+     CancelToken? cancelToken,
+   }) async {
++    if (usesNixCoreManifest) {
++      throw StateError('Libretro cores are managed by Nix');
++    }
+     final url = coreDownloadUrl(coreId);
+     if (url == null) {
+       throw StateError('No core build for this platform');
+@@ -87,6 +91,12 @@
+     void Function(double progress)? onProgress,
+     CancelToken? cancelToken,
+   }) async {
++    if (usesNixCoreManifest) {
++      if (!await coreSupportFilesInstalled(coreId)) {
++        throw StateError('Managed system files for $coreId are missing');
++      }
++      return;
++    }
+     final support = coreSupportFilesFor(coreId);
+     if (support == null) return;
+     if (await coreSupportFilesInstalled(coreId)) return;
+@@ -127,6 +137,9 @@
+ 
+   /// Deletes the installed core file and its support files, and forgets it.
+   Future<void> remove(String coreId) async {
++    if (usesNixCoreManifest) {
++      throw StateError('Libretro cores are managed by Nix');
++    }
+     final dir = await coresDirectory();
+     final file = File('${dir.path}/${coreFileName(coreId)}');
+     if (await file.exists()) await file.delete();
+--- a/lib/ui/screens/settings/emulator_cores_screen.dart
++++ b/lib/ui/screens/settings/emulator_cores_screen.dart
+@@ -121,7 +122,9 @@
+           children: [
+             Padding(
+               padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+-              child: Text(l10n.emulatorCoresDescription),
++              child: Text(usesNixCoreManifest
++                  ? 'Libretro cores are managed by Nix. Core settings remain editable.'
++                  : l10n.emulatorCoresDescription),
+             ),
+             adaptiveListSection(
+               children: [
+@@ -143,7 +146,9 @@
+     final isFirst = core.coreId == downloadableCores.first.coreId;
+ 
+     final String subtitle;
+-    if (!available) {
++    if (usesNixCoreManifest) {
++      subtitle = installed ? 'Managed by Nix' : l10n.emulatorCoreUnavailable;
++    } else if (!available) {
+       subtitle = l10n.emulatorCoreUnavailable;
+     } else if (downloading) {
+       subtitle = l10n.emulatorCoreDownloading;
+@@ -189,7 +194,7 @@
+                 ),
+               ),
+               value: installed || downloading,
+-              onChanged: (available && !downloading)
++              onChanged: (!usesNixCoreManifest && available && !downloading)
+                   ? (v) => _toggle(core, v)
+                   : null,
+             ),
+--- a/lib/ui/screens/settings/emulator_core_settings_screen.dart
++++ b/lib/ui/screens/settings/emulator_core_settings_screen.dart
+@@ -4,7 +4,6 @@
+ 
+ import '../../../playback/native_game_player.dart';
+ import '../../../util/game_cores.dart';
+-import '../../../util/game_storage.dart';
+ import '../../widgets/focus/dpad_list_tile.dart';
+ import '../../widgets/overlay_sheet.dart';
+ 
+@@ -67,7 +66,7 @@
+         });
+         return;
+       }
+-      final systemDir = await GameStorage.systemDir();
++      final systemDir = await systemDirectoryForCore(widget.coreId);
+       final player = NativeGamePlayer.create();
+       final probed = await player.probeOptions(corePath, systemDir.path);
+ 
+--- a/lib/ui/screens/playback/native_game_player_screen.dart
++++ b/lib/ui/screens/playback/native_game_player_screen.dart
+@@ -884,8 +884,9 @@
+           _releaseGameplayArtworkBlock();
+           if (mounted) {
+             setState(
+-              () => _error =
+-                  'The core for this system is not installed. Add it in Settings > Playback > Emulator Cores.',
++              () => _error = usesNixCoreManifest
++                  ? 'The managed core for this system is missing. Reinstall the Nix package.'
++                  : 'The core for this system is not installed. Add it in Settings > Playback > Emulator Cores.',
+             );
+           }
+           return;
+@@ -901,7 +902,7 @@
+ 
+       await GameStorage.migrateOffCache();
+       if (!await _installSupportFiles(coreId)) return;
+-      final systemDir = await GameStorage.systemDir();
++      final systemDir = await systemDirectoryForCore(coreId);
+       final saveDir = await GameStorage.saveDir();
+       final cacheDir = await GameStorage.romDir(
+         widget.libraryId,
+@@ -955,6 +956,12 @@
+         }
+         final biosFile = File(p.join(systemDir.path, biosFileName));
+         if (!await biosFile.exists()) {
++          if (usesNixCoreManifest &&
++              systemDir.path != (await GameStorage.systemDir()).path) {
++            throw StateError(
++              'Required BIOS file missing from managed system directory: $biosFileName',
++            );
++          }
+           await games.downloadBios(widget.libraryId, bios.id, biosFile.path);
+         }
+       }
+@@ -1046,6 +1053,15 @@
+   /// is on screen.
+   Future<bool> _installSupportFiles(String coreId) async {
+     if (await coreSupportFilesInstalled(coreId)) return true;
++    if (usesNixCoreManifest) {
++      if (mounted) {
++        setState(
++          () => _error =
++              'The managed system files for this core are missing. Reinstall the Nix package.',
++        );
++      }
++      return false;
++    }
+     if (!mounted) return false;
+     setState(() {
+       _status = 'Installing system files...';
+@@ -1102,7 +1118,7 @@
+       final corePath =
+           coreId == null ? null : await installedCorePath(coreId);
+-      if (corePath != null) {
++      if (coreId != null && corePath != null) {
+-        final systemDir = await GameStorage.systemDir();
++        final systemDir = await systemDirectoryForCore(coreId);
+         final probed = await _player.probeOptions(corePath, systemDir.path);
+         available = probed.isNotEmpty;
+       }
+--- a/lib/ui/screens/settings/panel/playback_category_screen.dart
++++ b/lib/ui/screens/settings/panel/playback_category_screen.dart
+@@ -81,7 +81,9 @@
+                     _TvSettingsListTile(
+                       leading: const Icon(Icons.videogame_asset),
+                       title: Text(l10n.emulatorCores),
+-                      subtitle: Text(l10n.emulatorCoresSubtitle),
++                      subtitle: Text(usesNixCoreManifest
++                          ? 'Native libretro cores provided by Nix'
++                          : l10n.emulatorCoresSubtitle),
+                       onTap: () => context.pushSettingsScreen(
+                         const EmulatorCoresScreen(),
+                       ),

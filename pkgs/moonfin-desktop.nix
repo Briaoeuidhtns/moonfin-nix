@@ -1,125 +1,124 @@
 {
   lib,
-  stdenv,
-  fetchurl,
+  flutter,
+  fetchFromGitHub,
   autoPatchelfHook,
-  makeWrapper,
-  wrapGAppsHook3,
+  copyDesktopItems,
+  makeDesktopItem,
+  python3,
   alsa-lib,
-  atk,
-  cairo,
-  fontconfig,
-  gdk-pixbuf,
-  glib,
   gtk3,
-  harfbuzz,
   libarchive,
   libepoxy,
   libsecret,
   libsoup_3,
   librsvg,
   mpv-unwrapped,
-  pango,
   sqlite,
   systemd,
   webkitgtk_4_1,
-  zlib,
+  cores,
 }:
-
 let
-  version = "2.7.0";
-  sources = {
-    x86_64-linux = {
-      name = "Moonfin_Linux_v${version}.tar.gz";
-      hash = "sha256-b6llMdnUqTyzBPfId1SI6LhNm9KzgwFNo3PY0eRdMuE=";
-    };
-    aarch64-linux = {
-      name = "Moonfin_LinuxARM64_v${version}.tar.gz";
-      hash = "sha256-33TtGDeOx0Cf3D4RTjWpw6Rx7p6O/VUrSLAH0kwnIiM=";
-    };
+  testCores = cores.override {
+    coreIds = [
+      "fceumm"
+      "ppsspp"
+    ];
   };
-  source = sources.${stdenv.hostPlatform.system};
 in
-stdenv.mkDerivation {
+flutter.buildFlutterApplication {
   pname = "moonfin-desktop";
-  inherit version;
+  version = "2.7.0";
 
-  src = fetchurl {
-    url = "https://github.com/Moonfin-Client/Moonfin-Core/releases/download/${version}/${source.name}";
-    inherit (source) hash;
+  src = fetchFromGitHub {
+    owner = "Moonfin-Client";
+    repo = "Moonfin-Core";
+    tag = "2.7.0";
+    hash = "sha256-fbc3ZKe/6/3Wik+GzEvpkYGxkOEdHIC84O4BcU7Ho+A=";
   };
+
+  pubspecLock = lib.importJSON ./pubspec.lock.json;
+  gitHashes = lib.importJSON ./git-hashes.json;
+  patches = [ ../patches/nix-libretro-cores.patch ];
+  postPatch = ''
+    cp ${../checks/discovery_test.dart} test/nix_core_discovery_test.dart
+  '';
 
   nativeBuildInputs = [
     autoPatchelfHook
-    makeWrapper
-    wrapGAppsHook3
+    copyDesktopItems
+    python3
   ];
-
-  # Only keep application-specific libraries. Bundled distribution libraries
-  # conflict with nixpkgs WebKit/GTK and graphics drivers at runtime.
   buildInputs = [
     alsa-lib
-    atk
-    cairo
-    fontconfig
-    gdk-pixbuf
-    glib
     gtk3
-    harfbuzz
     libarchive
     libepoxy
     libsecret
     libsoup_3
     librsvg
     mpv-unwrapped
-    pango
     sqlite
-    stdenv.cc.cc.lib
     webkitgtk_4_1
-    zlib
   ];
-
-  installPhase = ''
-    runHook preInstall
-
-    mkdir -p "$out/lib/moonfin/lib" "$out/bin" "$out/share"
-    cp moonfin-bin "$out/lib/moonfin/"
-    cp lib/*_plugin.so lib/libapp.so lib/libflutter_linux_gtk.so \
-      lib/libpdfium.so "$out/lib/moonfin/lib/"
-    cp -r data "$out/lib/moonfin/"
-    cp -r share/. "$out/share/"
-
-    # media_kit and SQLite look beside the application as well as using dlopen.
-    ln -s ${lib.getLib mpv-unwrapped}/lib/libmpv.so "$out/lib/moonfin/lib/libmpv.so"
-    ln -s ${lib.getLib sqlite}/lib/libsqlite3.so "$out/lib/moonfin/lib/libsqlite3.so"
-
-    runHook postInstall
+  extraWrapProgramArgs = ''
+    --prefix LD_LIBRARY_PATH : ${
+      lib.makeLibraryPath [
+        mpv-unwrapped
+        sqlite
+        systemd
+      ]
+    } \
+    --set MOONFIN_LIBRETRO_MANIFEST ${cores}/share/moonfin/cores.json
   '';
 
-  # Resolve libraries loaded dynamically rather than recorded in ELF NEEDED.
-  dontWrapGApps = true;
-  preFixup = ''
-    addAutoPatchelfSearchPath "$out/lib/moonfin/lib"
-    makeWrapper "$out/lib/moonfin/moonfin-bin" "$out/bin/moonfin" \
-      --prefix LD_LIBRARY_PATH : "$out/lib/moonfin/lib:${
-        lib.makeLibraryPath [
-          mpv-unwrapped
-          sqlite
-          systemd
-        ]
-      }" \
-      "''${gappsWrapperArgs[@]}"
+  doCheck = true;
+  checkPhase = ''
+    runHook preCheck
+    python - ${testCores}/share/moonfin/cores.json "$TMPDIR/test-cores.json" <<'PY'
+    import json
+    import pathlib
+    import sys
+    available = json.loads(pathlib.Path(sys.argv[1]).read_text())["cores"]
+    fixture = {"cores": {
+        "fceumm": available["fceumm"],
+        "ppsspp": available["ppsspp"],
+        "snes9x": {"path": "/no-such-core/snes9x_libretro.so"},
+    }}
+    pathlib.Path(sys.argv[2]).write_text(json.dumps(fixture))
+    PY
+    MOONFIN_LIBRETRO_MANIFEST="$TMPDIR/test-cores.json" \
+      flutter test --no-pub test/nix_core_discovery_test.dart
+    runHook postCheck
   '';
 
+  desktopItems = [
+    (makeDesktopItem {
+      name = "org.moonfin.linux";
+      desktopName = "Moonfin";
+      exec = "moonfin %U";
+      icon = "org.moonfin.linux";
+      comment = "Jellyfin & Emby media client";
+      categories = [
+        "AudioVideo"
+        "Video"
+      ];
+      mimeTypes = [ "x-scheme-handler/moonfin" ];
+      startupWMClass = "org.moonfin.linux";
+    })
+  ];
+  postInstall = ''
+    install -Dm644 assets/icons/app_icon.png \
+      "$out/share/icons/hicolor/512x512/apps/org.moonfin.linux.png"
+  '';
+
+  passthru = { inherit cores; };
   meta = {
-    description = "Moonfin Jellyfin and Emby desktop media client";
+    description = "Moonfin Jellyfin and Emby desktop media client with native libretro cores";
     homepage = "https://github.com/Moonfin-Client/Moonfin-Core";
     license = lib.licenses.gpl2Plus;
-    platforms = [
-      "x86_64-linux"
-      "aarch64-linux"
-    ];
+    platforms = [ "x86_64-linux" ];
     mainProgram = "moonfin";
-    sourceProvenance = with lib.sourceTypes; [ binaryNativeCode ];
   };
 }

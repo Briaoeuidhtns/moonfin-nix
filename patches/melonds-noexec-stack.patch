@@ -1,0 +1,10 @@
+--- a/src/ARMJIT_x64/ARMJIT_Linkage.S
++++ b/src/ARMJIT_x64/ARMJIT_Linkage.S
+@@ -104,3 +104,7 @@
+ #endif
+ 
+     ret
++
++#if defined(__ELF__)
++.section .note.GNU-stack,"",@progbits
++#endif
