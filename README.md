@@ -25,11 +25,11 @@ uses your desktop's Secret Service provider.
 
 ### NixOS / Home Manager
 
-Add this repository as an input to your configuration flake (use its eventual
-Git URL instead of the local path when publishing it):
+Add this repository as an input to your configuration flake. Keep its own
+Nixpkgs pin to retain the tested Flutter toolchain and native core versions:
 
 ```nix
-inputs.moonfin.url = "path:/home/brian/Projects/moonfin";
+inputs.moonfin.url = "github:Briaoeuidhtns/moonfin-nix";
 ```
 
 In a NixOS module receiving `inputs` via `specialArgs`:
